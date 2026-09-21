@@ -1,5 +1,5 @@
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -7,8 +7,12 @@ import json, re, unicodedata, csv, io
 from collections import defaultdict
 
 BASE=Path(__file__).resolve().parents[1]
+PDF_DIR=BASE/"data"/"pdfs"
+PDF_DIR.mkdir(parents=True, exist_ok=True)
 MODEL=json.loads((BASE/"data"/"model.json").read_text(encoding="utf-8"))
-app=FastAPI(title="Proyectos de Aula V3")
+DOCS_PATH=BASE/"data"/"project_documents.json"
+PROJECT_DOCUMENTS=json.loads(DOCS_PATH.read_text(encoding="utf-8")) if DOCS_PATH.exists() else {}
+app=FastAPI(title="Proyectos de Aula V4 – Destacados y PDF")
 
 def norm(s):
     if s is None: return ""
@@ -79,6 +83,46 @@ def contextual_options(filters):
             vals=sorted(set(vals),key=norm)
         out[field]=vals
     return out
+
+def _project_members(project):
+    """Return unique student names belonging to the project group."""
+    ids={e["student_id"] for e in MODEL["enrollments"]
+         if e["cohort_id"]==project["cohort_id"] and e["group_code"]==project["group"]}
+    return sorted(names_by_ids(MODEL["students"],ids), key=norm)
+
+def highlights(filters):
+    """Top 5 global projects and highlighted project(s) per semester in the selected context."""
+    cs,projects,assignments=selected(filters)
+    cmap={c["id"]:c for c in cs}
+    documents=PROJECT_DOCUMENTS
+    enriched=[]
+    for p in projects:
+        c=cmap.get(p["cohort_id"])
+        if not c or p.get("final_grade") is None:
+            continue
+        key=f'{p["cohort_id"]}:{p["group"]}'
+        enriched.append({
+            **p,
+            "program":c.get("program"),"period":c.get("period"),
+            "semester":c.get("semester"),"section":c.get("section"),
+            "members":_project_members(p),
+            "pdf_url":documents.get(key,"")
+        })
+    ranked=sorted(enriched,key=lambda x:(-x["final_grade"],x["semester"],str(x["section"]),x["group"],norm(x["title"])))
+    top5=ranked[:5]
+    by_semester=[]
+    for sem in sorted({x["semester"] for x in enriched}):
+        items=[x for x in enriched if x["semester"]==sem]
+        top=max(x["final_grade"] for x in items)
+        # Preserve ties rather than arbitrarily choosing one project.
+        by_semester.extend([x for x in items if abs(x["final_grade"]-top)<1e-9])
+    by_semester.sort(key=lambda x:(x["semester"],-x["final_grade"],str(x["section"]),x["group"]))
+    return {
+        "criteria":"Mayor promedio final del grupo según TERCER CORTE de DEFINITIVAS.",
+        "top5":top5,
+        "by_semester":by_semester,
+        "total_ranked":len(enriched)
+    }
 
 def dashboard(filters):
     cs,projects,assignments=selected(filters)
@@ -185,6 +229,27 @@ def teachers(period="",program="",semester="",section="",group="",teacher="",sub
                      "groups":len({(p["cohort_id"],p["group"]) for p in projects if p["cohort_id"] in {a["cohort_id"] for a in aa}})})
     return {"rows":sorted(rows,key=lambda r:norm(r["teacher"]))}
 
+@app.get("/api/highlights")
+def api_highlights(period="",program="",semester="",section="",group="",teacher="",subject=""):
+    return highlights({"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject})
+
+@app.post("/api/highlights/{cohort_id}/{group}/pdf")
+async def upload_highlight_pdf(cohort_id: str, group: str, file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF.")
+    safe_group=re.sub(r"[^A-Za-z0-9_-]+","_",str(group)).strip("_") or "grupo"
+    safe_cohort=re.sub(r"[^A-Za-z0-9_-]+","_",str(cohort_id)).strip("_") or "cohorte"
+    filename=f"{safe_cohort}_{safe_group}.pdf"
+    out=PDF_DIR/filename
+    data=await file.read()
+    if len(data)>20*1024*1024:
+        raise HTTPException(status_code=400, detail="El PDF supera el límite de 20 MB.")
+    out.write_bytes(data)
+    key=f"{cohort_id}:{group}"
+    PROJECT_DOCUMENTS[key]=f"/pdfs/{filename}"
+    DOCS_PATH.write_text(json.dumps(PROJECT_DOCUMENTS,ensure_ascii=False,indent=2),encoding="utf-8")
+    return {"ok":True,"pdf_url":PROJECT_DOCUMENTS[key],"filename":filename}
+
 @app.get("/api/audit")
 def audit():
     mism=[]
@@ -211,3 +276,4 @@ def export_projects(period="",program="",semester="",section="",group="",teacher
     return Response(out.getvalue(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=proyectos_aula.csv"})
 
 app.mount("/static",StaticFiles(directory=BASE/"static"),name="static")
+app.mount("/pdfs",StaticFiles(directory=PDF_DIR),name="pdfs")

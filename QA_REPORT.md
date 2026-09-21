@@ -1,4 +1,4 @@
-PROYECTOS DE AULA V3 — QA REPORT
+PROYECTOS DE AULA V4 — QA REPORT
 Fecha: 2026-09-21
 
 FUENTE
@@ -47,3 +47,16 @@ CONTROL DE CALIDAD DETECTADO
 RESULTADO
 Backend, modelo, endpoints, filtros dependientes y sintaxis frontend: PASS.
 Validación visual final: pendiente de ejecutarse en el Windows del usuario, donde ya existe Chromium/Edge y el servidor local.
+
+
+V4 — PRUEBAS DE DESTACADOS
+13. Compilación Python tras ajuste V4: PASS
+14. GET /api/highlights?period=2026-1: PASS
+15. Top 5 devuelve 5 proyectos con nota: PASS
+16. Destacado por semestre devuelve SEM-01 a SEM-06: PASS
+17. Integrantes se resuelven desde relaciones de matrícula: PASS
+18. Campo PDF sin documento devuelve estado “PDF pendiente de vincular”: PASS
+
+NOTA SOBRE PDF
+- Los documentos aún no fueron cargados porque no se proporcionaron los PDF de los proyectos.
+- La V4 deja preparada la relación `cohort_id:group` → URL PDF en `data/project_documents.json`.
