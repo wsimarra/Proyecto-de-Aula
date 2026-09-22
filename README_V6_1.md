@@ -1,4 +1,4 @@
-# Proyectos de Aula — V6.2 Producción + Chat IA
+# Proyectos de Aula — V6.3 Chat IA Libre
 
 ## Publicación
 - Build: `pip install -r requirements.txt`

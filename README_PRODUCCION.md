@@ -1,4 +1,4 @@
-# V6.2 Producción + Chat IA
+# V6.3 Chat IA Libre
 
 Build: `pip install -r requirements.txt`
 Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
