@@ -3,7 +3,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-import json, re, unicodedata, csv, io, os
+import json, re, unicodedata, csv, io, os, datetime
 from collections import defaultdict
 
 try:
@@ -17,7 +17,7 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 MODEL=json.loads((BASE/"data"/"model.json").read_text(encoding="utf-8"))
 DOCS_PATH=BASE/"data"/"project_documents.json"
 PROJECT_DOCUMENTS=json.loads(DOCS_PATH.read_text(encoding="utf-8")) if DOCS_PATH.exists() else {}
-app=FastAPI(title="Proyectos de Aula V6 – BI + Asistente IA")
+app=FastAPI(title="Proyectos de Aula V7.0 FINAL – BI Institucional Inteligente", version="7.0.0")
 
 def norm(s):
     if s is None: return ""
@@ -195,12 +195,21 @@ def dashboard(filters):
             for p in ps:
                 if abs(p["final_grade"]-top)<1e-9:
                     c=next(c for c in cs if c["id"]==p["cohort_id"])
-                    highlights.append({**p,"section":c["section"],"program":c["program"]})
+                    highlights.append({**p,"section":c["section"],"program":c["program"],"pdf_url":PROJECT_DOCUMENTS.get(f'{p["cohort_id"]}:{p["group"]}',"")})
     cmap={c["id"]:c for c in cs}
     enriched=[]
     for p in projects:
         c=cmap.get(p["cohort_id"],{})
-        enriched.append({**p,"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section")})
+        key=f'{p["cohort_id"]}:{p["group"]}'
+        enriched.append({**p,"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section"),"pdf_url":PROJECT_DOCUMENTS.get(key,"")})
+    top5=sorted(enriched,key=lambda x:(-(x.get("final_grade") or -1),x.get("semester", ""),str(x.get("section", "")),x.get("group", "")))[:5]
+    program_rows=[]
+    for program in sorted({c.get("program") for c in cs}):
+        pp=[p for p in enriched if p.get("program")==program]
+        pv=[p.get("final_grade") for p in pp if p.get("final_grade") is not None]
+        program_rows.append({"program":program,"projects":len(pp),"students":sum(int(p.get("student_count") or 0) for p in pp),"avg":round(sum(pv)/len(pv),2) if pv else None})
+    for x in bysem:
+        x["graded_projects"]=sum(1 for p in projects if (next((c for c in cs if c["id"]==p["cohort_id"]),{}).get("semester")==x["semester"] and p.get("final_grade") is not None))
     return {
       "filters":filters,"options":contextual_options(filters),
       "kpis":{
@@ -210,8 +219,8 @@ def dashboard(filters):
         "coverage":round(project_with_grade/len(projects)*100,1) if projects else 0,
         "graded_projects":project_with_grade,"missing_projects":len(projects)-project_with_grade
       },
-      "by_semester":bysem,"highlights":highlights,"subject_avg":subject_avg,
-      "projects":enriched,
+      "by_semester":bysem,"highlights":highlights,"top5":top5,"subject_avg":subject_avg,
+      "programs":program_rows,"projects":enriched,
       "teacher_names":names_by_ids(MODEL["teachers"],teachers)
     }
 
@@ -280,29 +289,60 @@ def api_highlights(period="",program="",semester="",section="",group="",teacher=
 
 @app.post("/api/highlights/{cohort_id}/{group}/pdf")
 async def upload_highlight_pdf(cohort_id: str, group: str, file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF.")
-    safe_group=re.sub(r"[^A-Za-z0-9_-]+","_",str(group)).strip("_") or "grupo"
-    safe_cohort=re.sub(r"[^A-Za-z0-9_-]+","_",str(cohort_id)).strip("_") or "cohorte"
-    filename=f"{safe_cohort}_{safe_group}.pdf"
-    out=PDF_DIR/filename
+    """Carga o reemplaza el PDF asociado a un proyecto válido."""
     try:
         cid=int(cohort_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Cohorte no válida.")
-    project=next((p for p in VALID_PROJECTS if p["cohort_id"]==cid and str(p["group"])==str(group)),None)
-    if project is None:
+    p=next((x for x in VALID_PROJECTS if x["cohort_id"]==cid and str(x["group"])==str(group)),None)
+    if p is None:
         raise HTTPException(status_code=404, detail="El grupo indicado no corresponde a un proyecto válido.")
-    data=await file.read()
-    if len(data)>20*1024*1024:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Solo se permiten archivos PDF.")
+    content=await file.read()
+    if len(content)>20*1024*1024:
         raise HTTPException(status_code=400, detail="El PDF supera el límite de 20 MB.")
-    if not data.startswith(b"%PDF-"):
+    if not content.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="El archivo no contiene una firma PDF válida.")
-    out.write_bytes(data)
-    key=f"{cohort_id}:{group}"
+    safe_cohort=re.sub(r"[^A-Za-z0-9_-]","_",str(cid))
+    safe_group=re.sub(r"[^A-Za-z0-9_-]","_",str(group))
+    key=f"{cid}:{group}"
+    filename=f"{safe_cohort}_{safe_group}.pdf"
+    path=PDF_DIR/filename
+    path.write_bytes(content)
     PROJECT_DOCUMENTS[key]=f"/pdfs/{filename}"
     DOCS_PATH.write_text(json.dumps(PROJECT_DOCUMENTS,ensure_ascii=False,indent=2),encoding="utf-8")
-    return {"ok":True,"pdf_url":PROJECT_DOCUMENTS[key],"filename":filename}
+    return {"ok":True,"pdf_url":PROJECT_DOCUMENTS[key],"filename":filename,"size_bytes":len(content),"updated_at":datetime.datetime.now().astimezone().isoformat()}
+
+@app.delete("/api/highlights/{cohort_id}/{group}/pdf")
+def delete_highlight_pdf(cohort_id: str, group: str):
+    """Elimina el PDF asociado al proyecto."""
+    key=f"{cohort_id}:{group}"
+    url=PROJECT_DOCUMENTS.pop(key,None)
+    if not url:
+        raise HTTPException(status_code=404, detail="Este proyecto no tiene un PDF adjunto.")
+    filename=Path(url).name
+    path=PDF_DIR/filename
+    if path.exists():
+        path.unlink()
+    DOCS_PATH.write_text(json.dumps(PROJECT_DOCUMENTS,ensure_ascii=False,indent=2),encoding="utf-8")
+    return {"ok":True,"deleted":filename}
+
+@app.get("/api/documents")
+def documents(period="",program="",semester="",section="",group="",teacher="",subject="",status=""):
+    """Inventario documental del contexto actual."""
+    d=dashboard({"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject})
+    cmap={c["id"]:c for c in MODEL["cohorts"]}
+    rows=[]
+    for p in d["projects"]:
+        c=cmap.get(p["cohort_id"],{})
+        key=f'{p["cohort_id"]}:{p["group"]}'
+        url=PROJECT_DOCUMENTS.get(key,"")
+        row={"cohort_id":p["cohort_id"],"group":p["group"],"project":str(p.get("title") or "").upper(),"period":c.get("period",""),"program":c.get("program",""),"semester":c.get("semester",""),"section":c.get("section",""),"student_count":p.get("student_count",0),"final_grade":p.get("final_grade"),"pdf_url":url,"has_pdf":bool(url)}
+        if status=="available" and not row["has_pdf"]: continue
+        if status=="pending" and row["has_pdf"]: continue
+        rows.append(row)
+    return {"rows":rows,"total":len(rows),"available":sum(1 for r in rows if r["has_pdf"]),"pending":sum(1 for r in rows if not r["has_pdf"]),"all_projects":len(d["projects"])}
 
 def _leader_filtered_records(period="", program="", semester="", section="", leader="", subject=""):
     rows=COLLECTIVE_LEADERS[:]
@@ -526,12 +566,6 @@ def _local_ai_answer(question, f):
     return a
 
 
-@app.get("/api/ai/status")
-def ai_status():
-    configured=bool(os.getenv("OPENAI_API_KEY")) and OpenAI is not None
-    return {"configured":configured,"provider":"openai" if configured else "local","model":os.getenv("OPENAI_MODEL","gpt-5")}
-
-
 @app.post("/api/ai/chat")
 def ai_chat(payload: dict = Body(...)):
     question=str(payload.get("message") or "").strip()
@@ -621,6 +655,38 @@ def ai_chat(payload: dict = Body(...)):
         "mode":"local"
     }
 
+
+@app.get("/api/project/{cohort_id}/{group}")
+def project_detail(cohort_id: str, group: str):
+    try: cid=int(cohort_id)
+    except ValueError: raise HTTPException(status_code=400, detail="Cohorte no válida.")
+    p=next((x for x in VALID_PROJECTS if x["cohort_id"]==cid and str(x["group"])==str(group)),None)
+    if p is None: raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+    c=next((x for x in MODEL["cohorts"] if x["id"]==cid),{})
+    members=_project_members(p)
+    leader=next((r.get("leader_name") for r in COLLECTIVE_LEADERS if r.get("cohort_id")==cid),"")
+    pdf_url=PROJECT_DOCUMENTS.get(f"{cid}:{group}","")
+    pdf_path=PDF_DIR/Path(pdf_url).name if pdf_url else None
+    pdf_meta={"url":pdf_url,"filename":pdf_path.name if pdf_path and pdf_path.exists() else "","size_bytes":pdf_path.stat().st_size if pdf_path and pdf_path.exists() else 0,"updated_at":datetime.datetime.fromtimestamp(pdf_path.stat().st_mtime).astimezone().isoformat() if pdf_path and pdf_path.exists() else ""}
+    return {**p,"title":str(p.get("title") or "").upper(),"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section"),"members":members,"leader":leader,"pdf_url":pdf_url,"pdf":pdf_meta}
+
+@app.get("/api/analytics")
+def analytics(period="",program="",semester="",section="",group="",teacher="",subject=""):
+    f={"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject}
+    d=dashboard(f)
+    projects=d["projects"]
+    grades=[float(p["final_grade"]) for p in projects if p.get("final_grade") is not None]
+    buckets=[0,0,0,0,0]
+    for n in grades:
+        buckets[min(4,max(0,int(n)))] += 1
+    return {"grade_distribution":{"labels":["0–0.99","1–1.99","2–2.99","3–3.99","4–5"],"values":buckets},"by_semester":d["by_semester"],"subject_avg":d["subject_avg"],"kpis":d["kpis"]}
+
+@app.get("/api/system/status")
+def system_status():
+    ai=bool(os.getenv("OPENAI_API_KEY")) and OpenAI is not None
+    pdf_count=sum(1 for v in PROJECT_DOCUMENTS.values() if v)
+    return {"version":"7.0.0-final","api":"ok","model_loaded":bool(MODEL),"projects_valid":len(VALID_PROJECTS),"source_files":len(MODEL.get("files",[])),"ai_configured":ai,"ai_mode":"generative" if ai else "local","pdf_storage":str(PDF_DIR),"documents_available":pdf_count,"documents_pending":max(0,len(VALID_PROJECTS)-pdf_count),"updated_at":datetime.datetime.now().astimezone().isoformat()}
+
 @app.get("/api/audit")
 def audit():
     excluded=[]
@@ -637,7 +703,7 @@ def audit():
         excluded.append(item); reason_counts[reason]+=1
     mism=[f for f in MODEL["files"] if f.get("sheet_section")!=f.get("section")]
     return {"files":MODEL["files"],"model":{
-      "period":"2026-1 · Primer periodo","source":"Archivos Excel locales",
+      "version":"7.0.0","period":"2026-1 · Primer periodo","source":"Archivos Excel locales",
       "note_rule":"Promedio de TERCER CORTE (TER-CORTE) en DEFINITIVAS para el grupo.",
       "title_rule":"Título tomado de LIDER, sección TITULOS DE LOS PROYECTOS DE AULA, según posición G01–G12.",
       "students_rule":"Estudiante = nombre normalizado; no sustituye un ID institucional cuando la fuente no lo proporciona.",
@@ -663,6 +729,22 @@ def export_projects(period="",program="",semester="",section="",group="",teacher
     for p in d["projects"]:
         c=cmap[p["cohort_id"]]; w.writerow([c["program"],c["period"],c["semester"],c["section"],p["group"],p["title"],p["student_count"],p["final_grade"] if p["final_grade"] is not None else "", "CON NOTA" if p["final_grade"] is not None else "SIN NOTA"])
     return Response(out.getvalue(),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=proyectos_aula.csv"})
+
+@app.get("/api/export/projects.xlsx")
+def export_projects_xlsx(period="",program="",semester="",section="",group="",teacher="",subject=""):
+    try:
+        from openpyxl import Workbook
+    except Exception:
+        raise HTTPException(status_code=500, detail="Exportación Excel no disponible.")
+    d=dashboard({"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject})
+    wb=Workbook(); ws=wb.active; ws.title="Proyectos"
+    ws.append(["Programa","Periodo","Semestre","Sección","Grupo","Proyecto","Estudiantes","Nota final","PDF"])
+    cmap={c["id"]:c for c in MODEL["cohorts"]}
+    for p in d["projects"]:
+        c=cmap[p["cohort_id"]]; key=f'{p["cohort_id"]}:{p["group"]}'
+        ws.append([c.get("program",""),c.get("period",""),c.get("semester",""),c.get("section",""),p.get("group",""),str(p.get("title") or "").upper(),p.get("student_count",0),p.get("final_grade"),"SI" if PROJECT_DOCUMENTS.get(key) else "NO"])
+    out=io.BytesIO(); wb.save(out); out.seek(0)
+    return Response(out.getvalue(),media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",headers={"Content-Disposition":"attachment; filename=proyectos_aula.xlsx"})
 
 app.mount("/static",StaticFiles(directory=BASE/"static"),name="static")
 app.mount("/pdfs",StaticFiles(directory=PDF_DIR),name="pdfs")
