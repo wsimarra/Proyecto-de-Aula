@@ -1,10 +1,20 @@
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-import json, re, unicodedata, csv, io
+import json, re, unicodedata, csv, io, os
 from collections import defaultdict
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 BASE=Path(__file__).resolve().parents[1]
 PDF_DIR=BASE/"data"/"pdfs"
@@ -12,7 +22,7 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 MODEL=json.loads((BASE/"data"/"model.json").read_text(encoding="utf-8"))
 DOCS_PATH=BASE/"data"/"project_documents.json"
 PROJECT_DOCUMENTS=json.loads(DOCS_PATH.read_text(encoding="utf-8")) if DOCS_PATH.exists() else {}
-app=FastAPI(title="Proyectos de Aula V5 – Lógica, Auditoría y Destacados")
+app=FastAPI(title="Proyectos de Aula V6 – BI + Asistente IA")
 
 def norm(s):
     if s is None: return ""
@@ -158,9 +168,11 @@ def highlights(filters):
 def dashboard(filters):
     cs,projects,assignments=selected(filters)
     cids={c["id"] for c in cs}
-    # assignments determine teacher count; enrollment determines student count
-    es=[e for e in MODEL["enrollments"] if e["cohort_id"] in cids]
-    students=sorted({e["student_id"] for e in es})
+    # Student KPI follows the institutional project-membership metric:
+    # sum of students attached to valid projects in the selected context.
+    # This is intentionally not a global unique-person count: the same student
+    # may participate in more than one project.
+    students_in_projects=sum(int(p.get("student_count") or 0) for p in projects)
     teachers=sorted({a["teacher_id"] for a in assignments})
     grades=[p["final_grade"] for p in projects if p["final_grade"] is not None]
     project_with_grade=sum(p["final_grade"] is not None for p in projects)
@@ -178,7 +190,7 @@ def dashboard(filters):
     for sem in sorted({c["semester"] for c in cs}):
         ps=[p for p in projects if next((c for c in cs if c["id"]==p["cohort_id"]),{}).get("semester")==sem]
         vals=[p["final_grade"] for p in ps if p["final_grade"] is not None]
-        bysem.append({"semester":sem,"projects":len(ps),"avg":round(sum(vals)/len(vals),2) if vals else None})
+        bysem.append({"semester":sem,"projects":len(ps),"students":sum(int(p.get("student_count") or 0) for p in ps),"avg":round(sum(vals)/len(vals),2) if vals else None})
     # highlights with ties
     highlights=[]
     for sem in sorted({x["semester"] for x in bysem}):
@@ -197,7 +209,7 @@ def dashboard(filters):
     return {
       "filters":filters,"options":contextual_options(filters),
       "kpis":{
-        "projects":len(projects),"students":len(students),"teachers":len(teachers),
+        "projects":len(projects),"students":students_in_projects,"teachers":len(teachers),
         "programs":len({c["program"] for c in cs}),"cohorts":len(cs),
         "avg_final":round(sum(grades)/len(grades),2) if grades else None,
         "coverage":round(project_with_grade/len(projects)*100,1) if projects else 0,
@@ -219,7 +231,9 @@ def meta():
             "periods":sorted({c["period"] for c in MODEL["cohorts"]}),
             "programs":sorted({c["program"] for c in MODEL["cohorts"]}),
             "collective_leaders":len(COLLECTIVE_LEADERS),
-            "unique_collective_leaders":len({r["leader_name"] for r in COLLECTIVE_LEADERS})}
+            "unique_collective_leaders":len({r["leader_name"] for r in COLLECTIVE_LEADERS}),
+            "students_in_valid_projects":sum(int(p.get("student_count") or 0) for p in VALID_PROJECTS),
+            "unique_students_in_valid_projects":len({e["student_id"] for e in MODEL["enrollments"] if (e["cohort_id"],e["group_code"]) in {(p["cohort_id"],p["group"]) for p in VALID_PROJECTS}})}
 
 @app.get("/api/options")
 def options(period="",program="",semester="",section="",group="",teacher="",subject=""):
@@ -233,8 +247,11 @@ def api_dashboard(period="",program="",semester="",section="",group="",teacher="
 def students(period="",program="",semester="",section="",group="",teacher="",subject=""):
     f={"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject}
     cs,projects,assignments=selected(f); cids={c["id"] for c in cs}
-    pids={(p["cohort_id"],p["group"]) for p in projects}
-    es=[e for e in MODEL["enrollments"] if e["cohort_id"] in cids and (not f.get("group") or e["group_code"]==f.get("group"))]
+    valid_project_keys={(p["cohort_id"],p["group"]) for p in projects}
+    es=[e for e in MODEL["enrollments"]
+        if e["cohort_id"] in cids
+        and (e["cohort_id"],e["group_code"]) in valid_project_keys
+        and (not f.get("group") or e["group_code"]==f.get("group"))]
     smap={s["id"]:s["name"] for s in MODEL["students"]}; cmap={c["id"]:c for c in MODEL["cohorts"]}
     # final grade per student from grades in DEFINITIVAS third-cut aggregate isn't stored; use project-group final grade as group context.
     pmap={(p["cohort_id"],p["group"]):p for p in projects}
@@ -320,12 +337,12 @@ def collective_leaders(period="", program="", semester="", section="", leader=""
     rows=_leader_filtered_records(period,program,semester,section,leader,subject)
     p_by_c=defaultdict(list)
     for p in VALID_PROJECTS: p_by_c[p["cohort_id"]].append(p)
-    e_by_c=defaultdict(set)
-    for e in MODEL["enrollments"]:
-        e_by_c[e["cohort_id"]].add(e["student_id"])
+    student_count_by_c=defaultdict(int)
+    for p in VALID_PROJECTS:
+        student_count_by_c[p["cohort_id"]] += int(p.get("student_count") or 0)
     result=[]
     for r in rows:
-        result.append({**r,"project_count":len(p_by_c.get(r["cohort_id"],[])),"student_count":len(e_by_c.get(r["cohort_id"],set()))})
+        result.append({**r,"project_count":len(p_by_c.get(r["cohort_id"],[])),"student_count":student_count_by_c.get(r["cohort_id"],0)})
     result.sort(key=lambda x:(x["semester"],int(x["section"]) if str(x["section"]).isdigit() else str(x["section"]),norm(x["leader_name"])))
     selected_leader=leader.strip() if leader else ""
     detail_rows=[]
@@ -341,15 +358,108 @@ def collective_leaders(period="", program="", semester="", section="", leader=""
     detail={}
     if selected_leader:
         detail_rows=[r for r in rows if norm(r["leader_name"])==norm(selected_leader)]
-        detail_rows=[{**r,"project_count":len(p_by_c.get(r["cohort_id"],[])),"student_count":len(e_by_c.get(r["cohort_id"],set()))} for r in detail_rows]
+        detail_rows=[{**r,"project_count":len(p_by_c.get(r["cohort_id"],[])),"student_count":student_count_by_c.get(r["cohort_id"],0)} for r in detail_rows]
         detail_rows.sort(key=lambda x:(x["semester"],int(x["section"]) if str(x["section"]).isdigit() else str(x["section"])))
-        detail_students={e["student_id"] for e in MODEL["enrollments"] if e["cohort_id"] in {r["cohort_id"] for r in detail_rows}}
-        detail={"name":selected_leader,"sections":len(detail_rows),"projects":sum(r["project_count"] for r in detail_rows),"students":len(detail_students),"rows":detail_rows}
-    return {"rows":result,"detail":detail,"options":_leader_options(period,program,semester,section,leader,subject),"total":len(result),"unique_leaders":len({r["leader_name"] for r in result}),"projects_total":len(VALID_PROJECTS),"students_total":len(MODEL["students"])}
+        detail={"name":selected_leader,"sections":len(detail_rows),"projects":sum(r["project_count"] for r in detail_rows),"students":sum(r["student_count"] for r in detail_rows),"rows":detail_rows}
+    return {"rows":result,"detail":detail,"options":_leader_options(period,program,semester,section,leader,subject),"total":len(result),"unique_leaders":len({r["leader_name"] for r in result}),"projects_total":len(VALID_PROJECTS),"students_total":sum(int(p.get("student_count") or 0) for p in VALID_PROJECTS)}
 
 @app.get("/api/collective-leaders")
 def api_collective_leaders(period="", program="", semester="", section="", leader="", subject=""):
     return collective_leaders(period,program,semester,section,leader,subject)
+
+
+@app.get("/api/ai/status")
+def ai_status():
+    """Estado del asistente IA. La clave nunca se devuelve al navegador."""
+    configured = bool(os.getenv("OPENAI_API_KEY")) and OpenAI is not None
+    return {"configured": configured, "provider": "openai" if configured else "local", "model": os.getenv("OPENAI_MODEL", "gpt-5")}
+
+
+def _local_ai_answer(question, f):
+    """Fallback determinista para que el chat siga funcionando sin proveedor externo."""
+    d=dashboard(f); qn=norm(question); projects=d["projects"]
+    graded=[p for p in projects if p.get("final_grade") is not None]; avg=d["kpis"].get("avg_final")
+    context=f"Periodo {f['period'] or 'todos'}; Programa {f['program'] or 'todos'}; Semestre {f['semester'] or 'todos'}; Sección {f['section'] or 'todas'}."
+    def project_line(p):
+        grade=p.get('final_grade'); gs=f" ({grade:.2f})" if isinstance(grade,(int,float)) else ""
+        return f"{p.get('group')} · {p.get('semester')} · SEC. {p.get('section')} — {str(p.get('title') or '').upper()}{gs}"
+    if any(x in qn for x in ["CUANTOS PROYECTOS","TOTAL DE PROYECTOS","NUMERO DE PROYECTOS","PROYECTOS HAY"]):
+        answer=f"Hay {d['kpis']['projects']} proyectos válidos en el contexto actual. {context}"
+    elif any(x in qn for x in ["CUANTOS ESTUDIANTES","ESTUDIANTES HAY","PARTICIPAN LOS ESTUDIANTES"]):
+        answer=f"Hay {d['kpis']['students']} participaciones estudiantiles en proyectos válidos. {context}"
+    elif any(x in qn for x in ["CUANTOS DOCENTES","DOCENTES HAY","PROFESORES HAY"]):
+        answer=f"Hay {d['kpis']['teachers']} docentes relacionados con el contexto actual."
+    elif any(x in qn for x in ["PROMEDIO","NOTA PROMEDIO","PROMEDIO FINAL"]):
+        answer=f"El promedio de nota final es {avg:.2f} sobre 5.00." if avg is not None else "No hay notas finales disponibles."
+    elif "TOP 5" in qn or "CINCO PROYECTOS" in qn:
+        top=sorted(graded,key=lambda p:p['final_grade'],reverse=True)[:5]
+        answer="Los 5 proyectos con mayor nota final en el contexto son:\n"+"\n".join(f"{i+1}. {project_line(p)}" for i,p in enumerate(top)) if top else "No hay notas disponibles."
+    elif any(x in qn for x in ["DESTACADO","DESTACADOS"]):
+        hs=d.get("highlights",[])[:6]
+        answer="Proyectos destacados según el criterio configurado de mayor nota final por semestre:\n"+"\n".join("• "+project_line(p) for p in hs) if hs else "No hay proyectos destacados para este contexto."
+    elif any(x in qn for x in ["REGLA","COMO SE CALCULA","CALCULA LA NOTA"]):
+        answer="La nota final del grupo se calcula como el promedio de DEFINITIVAS → TERCER CORTE → TER-CORTE. El título se toma de LIDER → TITULOS DE LOS PROYECTOS DE AULA."
+    elif any(x in qn for x in ["AUDITORIA","CALIDAD","EXCLUIDOS","INCONSISTENCIA"]):
+        inv=len(INVALID_PROJECTS); mism=sum(1 for x in MODEL["files"] if x.get("sheet_section")!=x.get("section"))
+        answer=f"El modelo contiene {len(VALID_PROJECTS)} proyectos válidos y {inv} registros excluidos. Se detectan {mism} discrepancias entre sección del archivo y LIDER!H2."
+    elif any(x in qn for x in ["LIDER","LIDERES","COLECTIVO"]):
+        rows=COLLECTIVE_LEADERS; unique=sorted({r['leader_name'] for r in rows},key=norm)
+        answer=f"Hay {len(rows)} asignaciones de líder de colectivo y {len(unique)} docentes líderes únicos."
+    else:
+        answer=f"En el contexto actual hay {d['kpis']['projects']} proyectos, {d['kpis']['students']} participaciones estudiantiles, {d['kpis']['teachers']} docentes y promedio final {avg:.2f} si hay notas."
+    return answer, context
+
+@app.get("/api/ai/status")
+def ai_status():
+    configured=bool(os.getenv("OPENAI_API_KEY")) and OpenAI is not None
+    return {"configured":configured,"provider":"openai" if configured else "local","model":os.getenv("OPENAI_MODEL","gpt-5")}
+
+def _local_ai_answer(question,f):
+    d=dashboard(f); qn=norm(question); projects=d["projects"]; graded=[x for x in projects if x.get("final_grade") is not None]; avg=d["kpis"].get("avg_final")
+    context=f"Periodo {f['period'] or 'todos'}; Programa {f['program'] or 'todos'}; Semestre {f['semester'] or 'todos'}; Sección {f['section'] or 'todas'}."
+    def line(x):
+        g=x.get("final_grade"); gs=f" ({g:.2f})" if isinstance(g,(int,float)) else ""
+        return f"{x.get('group')} · {x.get('semester')} · SEC. {x.get('section')} — {str(x.get('title') or '').upper()}{gs}"
+    if any(x in qn for x in ["CUANTOS PROYECTOS","TOTAL DE PROYECTOS","NUMERO DE PROYECTOS","PROYECTOS HAY"]): a=f"Hay {d['kpis']['projects']} proyectos válidos en el contexto actual. {context}"
+    elif any(x in qn for x in ["CUANTOS ESTUDIANTES","ESTUDIANTES HAY","PARTICIPAN LOS ESTUDIANTES"]): a=f"Hay {d['kpis']['students']} participaciones estudiantiles en proyectos válidos. {context}"
+    elif any(x in qn for x in ["CUANTOS DOCENTES","DOCENTES HAY","PROFESORES HAY"]): a=f"Hay {d['kpis']['teachers']} docentes relacionados con el contexto actual."
+    elif any(x in qn for x in ["PROMEDIO","NOTA PROMEDIO","PROMEDIO FINAL"]): a=f"El promedio de nota final es {avg:.2f} sobre 5.00." if avg is not None else "No hay notas finales disponibles."
+    elif "TOP 5" in qn or "CINCO PROYECTOS" in qn:
+        top=sorted(graded,key=lambda x:x['final_grade'],reverse=True)[:5]; a="Los 5 proyectos con mayor nota final en el contexto son:\n"+"\n".join(f"{i+1}. {line(x)}" for i,x in enumerate(top)) if top else "No hay notas disponibles."
+    elif any(x in qn for x in ["DESTACADO","DESTACADOS"]):
+        hs=d.get("highlights",[])[:6]; a="Proyectos destacados según el criterio configurado de mayor nota final por semestre:\n"+"\n".join("• "+line(x) for x in hs) if hs else "No hay proyectos destacados para este contexto."
+    elif any(x in qn for x in ["REGLA","COMO SE CALCULA","CALCULA LA NOTA"]): a="La nota final del grupo se calcula como el promedio de DEFINITIVAS → TERCER CORTE → TER-CORTE. El título se toma de LIDER → TITULOS DE LOS PROYECTOS DE AULA."
+    elif any(x in qn for x in ["AUDITORIA","CALIDAD","EXCLUIDOS","INCONSISTENCIA"]):
+        inv=len(INVALID_PROJECTS); mism=sum(1 for x in MODEL["files"] if x.get("sheet_section")!=x.get("section")); a=f"El modelo contiene {len(VALID_PROJECTS)} proyectos válidos y {inv} registros excluidos. Se detectan {mism} discrepancias entre sección del archivo y LIDER!H2."
+    elif any(x in qn for x in ["LIDER","LIDERES","COLECTIVO"]):
+        rows=COLLECTIVE_LEADERS; a=f"Hay {len(rows)} asignaciones de líder de colectivo y {len({r['leader_name'] for r in rows})} docentes líderes únicos."
+    else: a=f"En el contexto actual hay {d['kpis']['projects']} proyectos, {d['kpis']['students']} participaciones estudiantiles, {d['kpis']['teachers']} docentes y promedio final {avg:.2f} si hay notas."
+    return a,context
+
+@app.post("/api/ai/chat")
+def ai_chat(payload: dict = Body(...)):
+    question=str(payload.get("message") or "").strip(); filters=payload.get("filters") or {}
+    if not question: return {"answer":"Escribe una pregunta sobre los Proyectos de Aula.","sources":[]}
+    f={k:str(filters.get(k) or "") for k in ["period","program","semester","section","group","teacher","subject"]}; qn=norm(question)
+    sem=re.search(r"SEM[- ]?(0?[1-9]|1[0-2])",qn)
+    if sem and not f["semester"]: f["semester"]=f"SEM-{int(sem.group(1)):02d}"
+    sec=re.search(r"SECCI(?:ON|ÓN)\s*(\d+)",qn)
+    if sec and not f["section"]: f["section"]=sec.group(1)
+    d=dashboard(f)
+    context=f"Periodo: {f['period'] or 'todos'} | Programa: {f['program'] or 'todos'} | Semestre: {f['semester'] or 'todos'} | Sección: {f['section'] or 'todas'} | Grupo: {f['group'] or 'todos'} | Docente: {f['teacher'] or 'todos'} | Asignatura: {f['subject'] or 'todas'}"
+    projects=[{"semestre":x.get("semester"),"seccion":x.get("section"),"grupo":x.get("group"),"proyecto":str(x.get("title") or "").upper(),"nota":x.get("final_grade"),"estudiantes":x.get("student_count",0)} for x in d.get("projects",[])][:180]
+    data={"contexto":context,"kpis":d.get("kpis",{}),"por_semestre":d.get("by_semester",[]),"proyectos":projects,"destacados":d.get("highlights",[])[:10],"regla_nota":"Promedio de DEFINITIVAS → TERCER CORTE → TER-CORTE.","titulo":"LIDER → TITULOS DE LOS PROYECTOS DE AULA."}
+    if os.getenv("OPENAI_API_KEY") and OpenAI is not None:
+        try:
+            client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            instructions=("Eres el Analista IA de Proyectos de Aula. Responde en español, claro y ejecutivo, basándote exclusivamente en los datos entregados. No inventes cifras, nombres ni proyectos. Si falta un dato, dilo. Los nombres de proyectos deben conservarse completos y en MAYÚSCULAS. Cuando hables de destacados, aclara que el criterio configurado es mayor nota final por semestre, no calidad integral.")
+            resp=client.responses.create(model=os.getenv("OPENAI_MODEL","gpt-5"),instructions=instructions,input=[{"role":"user","content":f"DATOS DEL DASHBOARD:\n{json.dumps(data,ensure_ascii=False)}\n\nPREGUNTA:\n{question}"}],max_output_tokens=900)
+            answer=(getattr(resp,"output_text","") or "").strip()
+            if answer: return {"answer":answer,"sources":["Modelo institucional cargado en el dashboard","OpenAI API"],"context":context,"mode":"generative"}
+        except Exception:
+            return {"answer":"La IA generativa no está disponible en este momento. Verifica la configuración del servicio y vuelve a intentarlo.","sources":["Modelo institucional cargado en el dashboard"],"context":context,"mode":"fallback","error":"ai_unavailable"}
+    answer,_=_local_ai_answer(question,f)
+    return {"answer":answer,"sources":["Modelo institucional cargado en el dashboard"],"context":context,"mode":"local"}
 
 @app.get("/api/audit")
 def audit():
@@ -374,6 +484,8 @@ def audit():
       "project_count_rule":"Proyecto válido: grupo distinto de 0 y nota final mayor que 0; si la nota es 0, se conserva únicamente cuando LIDER documenta un título sustantivo.",
       "project_highlight":"Mayor nota final del grupo por semestre entre proyectos válidos; los empates se conservan.",
       "valid_projects":len(VALID_PROJECTS),
+      "students_in_valid_projects":sum(int(p.get("student_count") or 0) for p in VALID_PROJECTS),
+      "unique_students_in_valid_projects":len({e["student_id"] for e in MODEL["enrollments"] if (e["cohort_id"],e["group_code"]) in {(p["cohort_id"],p["group"]) for p in VALID_PROJECTS}}),
       "excluded_projects":len(INVALID_PROJECTS),
       "excluded_project_keys":[f"{p['cohort_id']}:{p['group']}" for p in INVALID_PROJECTS],
       "excluded":excluded,

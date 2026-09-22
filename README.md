@@ -1,4 +1,4 @@
-# Proyectos de Aula — V5.1 Líderes de Colectivo
+# Proyectos de Aula — V5.2 Líderes de Colectivo
 
 Versión local del dashboard de Gestión y Seguimiento de Proyectos de Aula.
 
@@ -16,7 +16,7 @@ Doble clic en `run_windows.bat` o ejecutar `python run_local.py`.
 - 26 asignaciones de Líder de Colectivo por sección.
 - 18 docentes únicos con rol de Líder de Colectivo.
 
-## Nueva funcionalidad V5.1
+## Nueva funcionalidad V5.2
 Se agregó el módulo **Líderes de Colectivo**. El dato se extrae de la hoja `LIDER` de cada archivo y se relaciona con semestre y sección. Un docente puede liderar varias secciones y esas asignaciones se conservan.
 
 Filtros del módulo:
@@ -33,3 +33,9 @@ Los proyectos válidos se calculan mediante la lógica corregida: se excluyen gr
 
 ## Siguiente fase
 La fuente puede migrarse posteriormente a OneDrive/SharePoint mediante Microsoft Graph sin rehacer el modelo ni la interfaz.
+
+
+### V5.2 — Corrección de estudiantes
+- La tarjeta principal usa **726 estudiantes en proyectos** (participaciones en los 154 proyectos válidos).
+- Se conserva 752 como estudiantes únicos registrados en toda la fuente para trazabilidad, y 725 como personas únicas dentro de proyectos válidos.
+- Los módulos de Líderes, Programas, Estudiantes y Auditoría usan la misma definición de 726 para mantener consistencia.
