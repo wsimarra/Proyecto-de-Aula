@@ -17,7 +17,7 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 MODEL=json.loads((BASE/"data"/"model.json").read_text(encoding="utf-8"))
 DOCS_PATH=BASE/"data"/"project_documents.json"
 PROJECT_DOCUMENTS=json.loads(DOCS_PATH.read_text(encoding="utf-8")) if DOCS_PATH.exists() else {}
-app=FastAPI(title="Proyectos de Aula V7.0 FINAL – BI Institucional Inteligente", version="7.0.0")
+app=FastAPI(title="Proyectos de Aula V9.1 – BI Institucional", version="9.1.0")
 
 def norm(s):
     if s is None: return ""
@@ -33,21 +33,41 @@ def _is_generic_project_title(title):
     return bool(re.fullmatch(r"(?:PROYECTO\s*\d+|GRUPO\s*#?\s*\d+)", t))
 
 def _project_exclusion_reason(project):
+    """Valida un proyecto sin descartar títulos genéricos que vienen de la fuente.
+
+    Regla V8: los títulos "PROYECTO N" se conservan porque son valores reales de
+    la fuente. Solo se excluyen grupos 0/sin título y un registro con nota 0 si
+    además no existe un título sustantivo.
+    """
     group=norm(project.get("group"))
     if not group or group in {"0", "G0", "GRUPO 0", "GRUPO#0"}:
         return "Grupo 0 (sin proyecto)"
-    grade=project.get("final_grade")
-    try:
-        if grade is not None and float(grade) > 0:
-            return ""
-    except (TypeError, ValueError):
-        pass
     title=str(project.get("title") or "").strip()
     if not title:
         return "Sin título de proyecto"
-    if _is_generic_project_title(title):
-        return "Título genérico (sin proyecto documentado)"
-    return ""
+    grade=project.get("final_grade")
+    try:
+        grade_value=float(grade) if grade is not None else None
+    except (TypeError, ValueError):
+        grade_value=None
+    # A positive grade is sufficient to keep the source record, even when its
+    # title is generic. This preserves the 58 generic source titles.
+    if grade_value is not None and grade_value > 0:
+        return ""
+    # A zero-grade record is retained only when the source has a substantive title.
+    if grade_value == 0 and _is_generic_project_title(title):
+        return "Título genérico con nota 0 (sin evidencia suficiente)"
+    if grade_value == 0:
+        return ""
+    return "Nota final no disponible"
+
+def _title_quality(title):
+    t=str(title or "").strip()
+    if not t:
+        return "SIN TÍTULO"
+    if _is_generic_project_title(t):
+        return "GENÉRICO DE FUENTE"
+    return "TÍTULO DESCRIPTIVO"
 
 def _is_valid_project(project):
     """Aplica la regla institucional de identificación de proyectos."""
@@ -56,6 +76,54 @@ def _is_valid_project(project):
 VALID_PROJECTS=[p for p in MODEL["projects"] if _is_valid_project(p)]
 INVALID_PROJECTS=[p for p in MODEL["projects"] if not _is_valid_project(p)]
 COLLECTIVE_LEADERS=MODEL.get("collective_leaders",[])
+
+def load_student_cut_notes():
+    """Carga SEG-CORTE y TER-CORTE individuales desde la hoja DEFINITIVAS de cada Excel."""
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return {}
+    cohort_map={(c["semester"], str(c["section"])): c["id"] for c in MODEL["cohorts"]}
+    result={}
+    excel_dir=BASE/"data"/"excel"
+    for path in sorted(excel_dir.glob("*.xlsx")):
+        m=re.search(r"TGNI-(SEM-\d+)-SEC-(\d+)\.xlsx$", path.name, re.I)
+        if not m:
+            continue
+        semester, section=m.group(1).upper(), str(int(m.group(2)))
+        cohort_id=cohort_map.get((semester, section))
+        if cohort_id is None:
+            continue
+        try:
+            wb=load_workbook(path, data_only=True, read_only=True)
+            if "DEFINITIVAS" not in wb.sheetnames:
+                wb.close()
+                continue
+            ws=wb["DEFINITIVAS"]
+            # En la hoja, B=estudiante, C=grupo, D=SEG-CORTE, E=TER-CORTE.
+            for row in ws.iter_rows(min_row=5, values_only=True):
+                name=row[1] if len(row)>1 else None
+                group=row[2] if len(row)>2 else None
+                seg=row[3] if len(row)>3 else None
+                ter=row[4] if len(row)>4 else None
+                if not name or not group or str(group).strip() in {"0", "None", ""}:
+                    continue
+                result[(cohort_id, norm(name), str(group).strip().upper())]={"followup2":seg, "followup3":ter}
+            wb.close()
+        except Exception:
+            # El dashboard sigue funcionando; las notas ausentes se muestran como N/D.
+            continue
+    return result
+
+STUDENT_CUT_NOTES=load_student_cut_notes()
+
+def numeric_grade(value):
+    """Devuelve una nota numérica válida; errores de Excel y textos se consideran no disponibles."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or value > 5:
+        return None
+    return float(value)
 
 
 def selected(filters):
@@ -142,6 +210,7 @@ def highlights(filters):
             "program":c.get("program"),"period":c.get("period"),
             "semester":c.get("semester"),"section":c.get("section"),
             "members":_project_members(p),
+            "title_quality":_title_quality(p.get("title")),
             "pdf_url":documents.get(key,"")
         })
     ranked=sorted(enriched,key=lambda x:(-x["final_grade"],x["semester"],str(x["section"]),x["group"],norm(x["title"])))
@@ -169,8 +238,11 @@ def dashboard(filters):
     # may participate in more than one project.
     students_in_projects=sum(int(p.get("student_count") or 0) for p in projects)
     teachers=sorted({a["teacher_id"] for a in assignments})
-    grades=[p["final_grade"] for p in projects if p["final_grade"] is not None]
+    grades=[float(p["final_grade"]) for p in projects if p["final_grade"] is not None]
     project_with_grade=sum(p["final_grade"] is not None for p in projects)
+    unique_student_ids={e["student_id"] for e in MODEL["enrollments"] if e["cohort_id"] in cids and (e["cohort_id"],e["group_code"]) in {(p["cohort_id"],p["group"]) for p in projects}}
+    weighted_sum=sum(float(p["final_grade"])*int(p.get("student_count") or 0) for p in projects if p.get("final_grade") is not None)
+    weighted_n=sum(int(p.get("student_count") or 0) for p in projects if p.get("final_grade") is not None)
     # subject averages
     sids={a["subject_id"] for a in assignments}
     g=[x for x in MODEL["grades"] if x["cohort_id"] in cids and x["subject_id"] in sids]
@@ -201,7 +273,7 @@ def dashboard(filters):
     for p in projects:
         c=cmap.get(p["cohort_id"],{})
         key=f'{p["cohort_id"]}:{p["group"]}'
-        enriched.append({**p,"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section"),"pdf_url":PROJECT_DOCUMENTS.get(key,"")})
+        enriched.append({**p,"title_quality":_title_quality(p.get("title")),"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section"),"pdf_url":PROJECT_DOCUMENTS.get(key,"")})
     top5=sorted(enriched,key=lambda x:(-(x.get("final_grade") or -1),x.get("semester", ""),str(x.get("section", "")),x.get("group", "")))[:5]
     program_rows=[]
     for program in sorted({c.get("program") for c in cs}):
@@ -214,10 +286,14 @@ def dashboard(filters):
       "filters":filters,"options":contextual_options(filters),
       "kpis":{
         "projects":len(projects),"students":students_in_projects,"teachers":len(teachers),
-        "programs":len({c["program"] for c in cs}),"cohorts":len(cs),
+        "subjects":len(sids),"programs":len({c["program"] for c in cs}),"cohorts":len(cs),
+        "sections":len({(c["period"],c["program"],c["semester"],c["section"]) for c in cs}),
+        "unique_students":len(unique_student_ids),
         "avg_final":round(sum(grades)/len(grades),2) if grades else None,
+        "avg_final_weighted":round(weighted_sum/weighted_n,2) if weighted_n else None,
         "coverage":round(project_with_grade/len(projects)*100,1) if projects else 0,
-        "graded_projects":project_with_grade,"missing_projects":len(projects)-project_with_grade
+        "graded_projects":project_with_grade,"missing_projects":len(projects)-project_with_grade,
+        "generic_titles":sum(1 for p in projects if _is_generic_project_title(p.get("title")))
       },
       "by_semester":bysem,"highlights":highlights,"top5":top5,"subject_avg":subject_avg,
       "programs":program_rows,"projects":enriched,
@@ -229,7 +305,7 @@ def home(): return FileResponse(BASE/"static"/"index.html")
 
 @app.get("/api/meta")
 def meta():
-    return {"files":len(MODEL["files"]),"cohorts":len(MODEL["cohorts"]),
+    return {"version":"9.0.0","files":len(MODEL["files"]),"cohorts":len(MODEL["cohorts"]),
             "students":len(MODEL["students"]),"teachers":len(MODEL["teachers"]),
             "subjects":len(MODEL["subjects"]),"projects":len(VALID_PROJECTS),
             "periods":sorted({c["period"] for c in MODEL["cohorts"]}),
@@ -237,7 +313,8 @@ def meta():
             "collective_leaders":len(COLLECTIVE_LEADERS),
             "unique_collective_leaders":len({r["leader_name"] for r in COLLECTIVE_LEADERS}),
             "students_in_valid_projects":sum(int(p.get("student_count") or 0) for p in VALID_PROJECTS),
-            "unique_students_in_valid_projects":len({e["student_id"] for e in MODEL["enrollments"] if (e["cohort_id"],e["group_code"]) in {(p["cohort_id"],p["group"]) for p in VALID_PROJECTS}})}
+            "unique_students_in_valid_projects":len({e["student_id"] for e in MODEL["enrollments"] if (e["cohort_id"],e["group_code"]) in {(p["cohort_id"],p["group"]) for p in VALID_PROJECTS}}),
+            "generic_source_titles":sum(1 for p in VALID_PROJECTS if _is_generic_project_title(p.get("title")))}
 
 @app.get("/api/options")
 def options(period="",program="",semester="",section="",group="",teacher="",subject=""):
@@ -252,36 +329,57 @@ def students(period="",program="",semester="",section="",group="",teacher="",sub
     f={"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject}
     cs,projects,assignments=selected(f); cids={c["id"] for c in cs}
     valid_project_keys={(p["cohort_id"],p["group"]) for p in projects}
-    es=[e for e in MODEL["enrollments"]
-        if e["cohort_id"] in cids
-        and (e["cohort_id"],e["group_code"]) in valid_project_keys
-        and (not f.get("group") or e["group_code"]==f.get("group"))]
-    smap={s["id"]:s["name"] for s in MODEL["students"]}; cmap={c["id"]:c for c in MODEL["cohorts"]}
-    # final grade per student from grades in DEFINITIVAS third-cut aggregate isn't stored; use project-group final grade as group context.
+    es=[e for e in MODEL["enrollments"] if e["cohort_id"] in cids and (e["cohort_id"],e["group_code"]) in valid_project_keys and (not f.get("group") or e["group_code"]==f.get("group"))]
+    smap={x["id"]:x["name"] for x in MODEL["students"]}; cmap={c["id"]:c for c in cs}
     pmap={(p["cohort_id"],p["group"]):p for p in projects}
     rows=[]
     for e in es:
         c=cmap[e["cohort_id"]]; p=pmap.get((e["cohort_id"],e["group_code"]))
-        rows.append({"student":smap[e["student_id"]],"semester":c["semester"],"section":c["section"],
-                     "group":e["group_code"],"project":p["title"] if p else "—",
+        student_name=smap[e["student_id"]]
+        cut=STUDENT_CUT_NOTES.get((e["cohort_id"], norm(student_name), str(e["group_code"]).strip().upper()), {})
+        raw_followup2=numeric_grade(cut.get("followup2"))
+        raw_followup3=numeric_grade(cut.get("followup3"))
+        # Los cortes se presentan con un decimal, como en la hoja fuente; la definitiva promedia esos valores mostrados.
+        followup2=round(raw_followup2,1) if raw_followup2 is not None else None
+        followup3=round(raw_followup3,1) if raw_followup3 is not None else None
+        # Ambos cortes tienen el mismo peso (50 %): definitiva individual = promedio simple.
+        definitive=round((followup2+followup3)/2, 2) if followup2 is not None and followup3 is not None else None
+        rows.append({"student":student_name,"semester":c["semester"],"section":c["section"],"program":c["program"],"period":c["period"],
+                     "group":e["group_code"],"project":p["title"] if p else "—","subject":"", "teacher":"",
+                     "followup2":followup2,
+                     "followup3":followup3,
+                     "definitive":definitive,
                      "group_final":round(p["final_grade"],2) if p and p["final_grade"] is not None else None})
-    # deduplicate student+cohort+group
     uniq={(r["student"],r["semester"],r["section"],r["group"]):r for r in rows}
-    return {"rows":sorted(uniq.values(),key=lambda r:(r["semester"],r["section"],r["group"],norm(r["student"])))}
+    return {"rows":sorted(uniq.values(),key=lambda r:(r["semester"],r["section"],r["group"],norm(r["student"]))),
+            "grade_source_note":"Seguimiento 2 = SEG-CORTE; Seguimiento 3 = TER-CORTE de la hoja DEFINITIVAS. Definitiva individual = promedio simple de ambos cortes (50 % cada uno); si falta una nota válida, se deja pendiente."}
 
 @app.get("/api/teachers")
-def teachers(period="",program="",semester="",section="",group="",teacher="",subject=""):
+def teachers(period="",program="",semester="",section="",group="",teacher="",subject="",status=""):
     f={"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":teacher,"subject":subject}
-    cs,projects,assignments=selected(f); cids={c["id"] for c in cs}
-    cmap={c["id"]:c for c in cs}; tmap={t["id"]:t["name"] for t in MODEL["teachers"]}; smap={s["id"]:s["name"] for s in MODEL["subjects"]}
+    cs,projects,assignments=selected(f); cids={c["id"] for c in cs}; tmap={t["id"]:t["name"] for t in MODEL["teachers"]}; smap={s["id"]:s["name"] for s in MODEL["subjects"]}
+    grade_keys={(g["cohort_id"],g["subject_id"]) for g in MODEL.get("grades",[]) if g.get("grade") is not None}
+    by_teacher=defaultdict(list)
+    for a in assignments:
+        if a["cohort_id"] not in cids: continue
+        has=(a["cohort_id"],a["subject_id"]) in grade_keys
+        by_teacher[a["teacher_id"]].append({"cohort_id":a["cohort_id"],"subject_id":a["subject_id"],"has_grades":has})
     rows=[]
-    for tid in sorted({a["teacher_id"] for a in assignments}):
-        aa=[a for a in assignments if a["teacher_id"]==tid]
-        rows.append({"teacher":tmap[tid],"subjects":sorted({smap[a["subject_id"]] for a in aa},key=norm),
-                     "cohorts":len({a["cohort_id"] for a in aa}),
-                     "projects":len([p for p in projects if p["cohort_id"] in {a["cohort_id"] for a in aa}]),
-                     "groups":len({(p["cohort_id"],p["group"]) for p in projects if p["cohort_id"] in {a["cohort_id"] for a in aa}})})
-    return {"rows":sorted(rows,key=lambda r:norm(r["teacher"]))}
+    for tid,aa in by_teacher.items():
+        graded=sum(1 for a in aa if a["has_grades"]); pending=len(aa)-graded
+        row={"teacher":tmap[tid],"subjects":sorted({smap[a["subject_id"]] for a in aa},key=norm),
+             "cohorts":len({a["cohort_id"] for a in aa}),
+             "projects":len([p for p in projects if p["cohort_id"] in {a["cohort_id"] for a in aa}]),
+             "groups":len({(p["cohort_id"],p["group"]) for p in projects if p["cohort_id"] in {a["cohort_id"] for a in aa}}),
+             "assignments":len(aa),"graded_assignments":graded,"pending_assignments":pending,
+             "status":"CON NOTAS" if graded and not pending else ("SIN NOTAS" if not graded else "PARCIAL")}
+        rows.append(row)
+    if status=="graded": rows=[r for r in rows if r["graded_assignments"]>0]
+    elif status=="pending": rows=[r for r in rows if r["pending_assignments"]>0]
+    elif status=="none": rows=[r for r in rows if r["graded_assignments"]==0]
+    return {"rows":sorted(rows,key=lambda r:norm(r["teacher"])),
+            "note":"El estado se infiere por existencia de notas TERCERO en la asignatura/cohorte. La fuente no registra el usuario que digitó cada nota.",
+            "summary":{"teachers":len(rows),"with_grades":sum(1 for r in rows if r["graded_assignments"]>0),"without_grades":sum(1 for r in rows if r["graded_assignments"]==0),"partial":sum(1 for r in rows if r["status"]=="PARCIAL")}}
 
 @app.get("/api/highlights")
 def api_highlights(period="",program="",semester="",section="",group="",teacher="",subject=""):
@@ -656,6 +754,118 @@ def ai_chat(payload: dict = Body(...)):
     }
 
 
+
+@app.get("/api/teacher-detail")
+def teacher_detail(teacher: str = "", period="", program="", semester="", section="", group="", subject=""):
+    """Detalle de responsabilidad académica inferida por docente/asignatura/cohorte.
+    El estado se calcula con las notas existentes por estudiante y grupo; no identifica quién digitó la nota.
+    """
+    if not teacher.strip():
+        raise HTTPException(status_code=400, detail="Debe indicar un docente.")
+    f={"period":period,"program":program,"semester":semester,"section":section,"group":group,"teacher":"","subject":subject}
+    cs, projects, assignments = selected(f)
+    tmatch = next((t for t in MODEL["teachers"] if norm(t["name"]) == norm(teacher)), None)
+    if not tmatch:
+        raise HTTPException(status_code=404, detail="Docente no encontrado.")
+    tid = tmatch["id"]
+    cohort_map = {c["id"]: c for c in cs}
+    subject_map = {s["id"]: s["name"] for s in MODEL["subjects"]}
+    student_map = {s["id"]: s["name"] for s in MODEL["students"]}
+    # Keep only assignments belonging to the selected teacher and visible context.
+    own_assignments = [a for a in assignments if a["teacher_id"] == tid and a["cohort_id"] in cohort_map]
+    grade_keys = {(g["cohort_id"], g["subject_id"], g["student_id"])
+                  for g in MODEL.get("grades", []) if g.get("grade") is not None}
+    rows = []
+    for a in own_assignments:
+        cid, sid = a["cohort_id"], a["subject_id"]
+        c = cohort_map[cid]
+        cohort_projects = [p for p in projects if p["cohort_id"] == cid]
+        for p in cohort_projects:
+            group = str(p["group"]).strip().upper()
+            members = [e for e in MODEL["enrollments"]
+                       if e["cohort_id"] == cid and str(e.get("group_code", "")).strip().upper() == group
+                       and e["subject_id"] == sid]
+            member_ids = {e["student_id"] for e in members}
+            graded_ids = {student_id for (grade_cid, grade_sid, student_id) in grade_keys
+                          if grade_cid == cid and grade_sid == sid and student_id in member_ids}
+            total = len(member_ids)
+            graded = len(graded_ids)
+            if total == 0 or graded == 0:
+                status = "PENDIENTE"
+            elif graded < total:
+                status = "PARCIAL"
+            else:
+                status = "CON NOTAS"
+            rows.append({
+                "period": c.get("period", ""), "program": c.get("program", ""),
+                "semester": c.get("semester", ""), "section": c.get("section", ""),
+                "cohort_id": cid, "subject": subject_map.get(sid, "—"),
+                "group": p["group"], "project": str(p.get("title") or "").upper(),
+                "students": total, "graded_students": graded,
+                "pending_students": max(total - graded, 0), "status": status,
+                "final_grade": p.get("final_grade")
+            })
+    # Remove duplicate rows if source has repeated equivalent assignment/project relationships.
+    unique = {}
+    for r in rows:
+        key = (r["cohort_id"], r["subject"], str(r["group"]))
+        unique[key] = r
+    result = sorted(unique.values(), key=lambda r: (r["semester"], int(r["section"] or 0), r["subject"], r["group"]))
+    return {
+        "teacher": tmatch["name"],
+        "rows": result,
+        "summary": {
+            "projects": len(result),
+            "graded": sum(1 for r in result if r["status"] == "CON NOTAS"),
+            "partial": sum(1 for r in result if r["status"] == "PARCIAL"),
+            "pending": sum(1 for r in result if r["status"] == "PENDIENTE"),
+            "students": sum(r["students"] for r in result),
+            "graded_students": sum(r["graded_students"] for r in result)
+        },
+        "note": "La responsabilidad se infiere de la asignación docente-asignatura-cohorte. El estado refleja notas existentes para estudiantes del grupo; la fuente no identifica quién digitó cada nota."
+    }
+
+
+@app.get("/api/export/teacher-detail.xlsx")
+def export_teacher_detail_xlsx(teacher: str = "", period="", program="", semester="", section="", group="", subject=""):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    data = teacher_detail(teacher=teacher, period=period, program=program, semester=semester,
+                          section=section, group=group, subject=subject)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Seguimiento docente"
+    ws.append(["SEGUIMIENTO DE CALIFICACIONES POR DOCENTE"])
+    ws.append(["Docente", data["teacher"]])
+    ws.append(["Criterio", data["note"]])
+    ws.append([])
+    headers = ["Periodo", "Programa", "Semestre", "Sección", "Asignatura", "Grupo", "Proyecto",
+               "Estudiantes", "Estudiantes con nota", "Pendientes", "Estado"]
+    ws.append(headers)
+    for r in data["rows"]:
+        ws.append([r.get("period"), r.get("program"), r.get("semester"), r.get("section"),
+                   r.get("subject"), r.get("group"), r.get("project"), r.get("students"),
+                   r.get("graded_students"), r.get("pending_students"), r.get("status")])
+    ws.freeze_panes = "A6"
+    ws.auto_filter.ref = f"A5:K{max(ws.max_row, 5)}"
+    for cell in ws[5]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="193B66")
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    widths = [14, 34, 12, 10, 36, 10, 60, 14, 20, 12, 18]
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[chr(64+i)].width = width
+    for row in ws.iter_rows(min_row=6):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=(cell.column in (2,5,7)))
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", data["teacher"]).strip("_") or "docente"
+    return Response(content=buffer.getvalue(),
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="seguimiento_docente_{safe}.xlsx"'})
+
 @app.get("/api/project/{cohort_id}/{group}")
 def project_detail(cohort_id: str, group: str):
     try: cid=int(cohort_id)
@@ -668,7 +878,7 @@ def project_detail(cohort_id: str, group: str):
     pdf_url=PROJECT_DOCUMENTS.get(f"{cid}:{group}","")
     pdf_path=PDF_DIR/Path(pdf_url).name if pdf_url else None
     pdf_meta={"url":pdf_url,"filename":pdf_path.name if pdf_path and pdf_path.exists() else "","size_bytes":pdf_path.stat().st_size if pdf_path and pdf_path.exists() else 0,"updated_at":datetime.datetime.fromtimestamp(pdf_path.stat().st_mtime).astimezone().isoformat() if pdf_path and pdf_path.exists() else ""}
-    return {**p,"title":str(p.get("title") or "").upper(),"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section"),"members":members,"leader":leader,"pdf_url":pdf_url,"pdf":pdf_meta}
+    return {**p,"title":str(p.get("title") or "").upper(),"title_quality":_title_quality(p.get("title")),"program":c.get("program"),"period":c.get("period"),"semester":c.get("semester"),"section":c.get("section"),"members":members,"leader":leader,"pdf_url":pdf_url,"pdf":pdf_meta}
 
 @app.get("/api/analytics")
 def analytics(period="",program="",semester="",section="",group="",teacher="",subject=""):
@@ -685,7 +895,7 @@ def analytics(period="",program="",semester="",section="",group="",teacher="",su
 def system_status():
     ai=bool(os.getenv("OPENAI_API_KEY")) and OpenAI is not None
     pdf_count=sum(1 for v in PROJECT_DOCUMENTS.values() if v)
-    return {"version":"7.0.0-final","api":"ok","model_loaded":bool(MODEL),"projects_valid":len(VALID_PROJECTS),"source_files":len(MODEL.get("files",[])),"ai_configured":ai,"ai_mode":"generative" if ai else "local","pdf_storage":str(PDF_DIR),"documents_available":pdf_count,"documents_pending":max(0,len(VALID_PROJECTS)-pdf_count),"updated_at":datetime.datetime.now().astimezone().isoformat()}
+    return {"version":"9.0.0","api":"ok","model_loaded":bool(MODEL),"projects_valid":len(VALID_PROJECTS),"source_files":len(MODEL.get("files",[])),"ai_configured":ai,"ai_mode":"generative" if ai else "local","pdf_storage":str(PDF_DIR),"documents_available":pdf_count,"documents_pending":max(0,len(VALID_PROJECTS)-pdf_count),"generic_source_titles":sum(1 for p in VALID_PROJECTS if _is_generic_project_title(p.get("title"))),"updated_at":datetime.datetime.now().astimezone().isoformat()}
 
 @app.get("/api/audit")
 def audit():
@@ -703,13 +913,14 @@ def audit():
         excluded.append(item); reason_counts[reason]+=1
     mism=[f for f in MODEL["files"] if f.get("sheet_section")!=f.get("section")]
     return {"files":MODEL["files"],"model":{
-      "version":"7.0.0","period":"2026-1 · Primer periodo","source":"Archivos Excel locales",
+      "version":"9.0.0","period":"2026-1 · Primer periodo","source":"Archivos Excel locales",
       "note_rule":"Promedio de TERCER CORTE (TER-CORTE) en DEFINITIVAS para el grupo.",
       "title_rule":"Título tomado de LIDER, sección TITULOS DE LOS PROYECTOS DE AULA, según posición G01–G12.",
       "students_rule":"Estudiante = nombre normalizado; no sustituye un ID institucional cuando la fuente no lo proporciona.",
-      "project_count_rule":"Proyecto válido: grupo distinto de 0 y nota final mayor que 0; si la nota es 0, se conserva únicamente cuando LIDER documenta un título sustantivo.",
+      "project_count_rule":"Proyecto válido: grupo distinto de 0 y título presente. Los 58 títulos genéricos positivos (por ejemplo, PROYECTO 1) se conservan porque son valores reales de la fuente. Un registro con nota 0 y título genérico se excluye por falta de evidencia suficiente.",
       "project_highlight":"Mayor nota final del grupo por semestre entre proyectos válidos; los empates se conservan.",
       "valid_projects":len(VALID_PROJECTS),
+      "generic_source_titles":sum(1 for p in VALID_PROJECTS if _is_generic_project_title(p.get("title"))),
       "students_in_valid_projects":sum(int(p.get("student_count") or 0) for p in VALID_PROJECTS),
       "unique_students_in_valid_projects":len({e["student_id"] for e in MODEL["enrollments"] if (e["cohort_id"],e["group_code"]) in {(p["cohort_id"],p["group"]) for p in VALID_PROJECTS}}),
       "excluded_projects":len(INVALID_PROJECTS),
@@ -745,6 +956,25 @@ def export_projects_xlsx(period="",program="",semester="",section="",group="",te
         ws.append([c.get("program",""),c.get("period",""),c.get("semester",""),c.get("section",""),p.get("group",""),str(p.get("title") or "").upper(),p.get("student_count",0),p.get("final_grade"),"SI" if PROJECT_DOCUMENTS.get(key) else "NO"])
     out=io.BytesIO(); wb.save(out); out.seek(0)
     return Response(out.getvalue(),media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",headers={"Content-Disposition":"attachment; filename=proyectos_aula.xlsx"})
+
+@app.get("/api/export/students.xlsx")
+def export_students_xlsx(period="",program="",semester="",section="",group="",teacher="",subject="",search=""):
+    try:
+        from openpyxl import Workbook
+    except Exception:
+        raise HTTPException(status_code=500, detail="Exportación Excel no disponible.")
+    data=students(period,program,semester,section,group,teacher,subject)
+    if search.strip():
+        needle=norm(search)
+        data["rows"]=[r for r in data["rows"] if needle in norm(r["student"]) or needle in norm(r["project"])]
+    wb=Workbook(); ws=wb.active; ws.title="Notas estudiantes"
+    ws.append(["Estudiante","Periodo","Programa","Semestre","Sección","Grupo","Proyecto","Nota seguimiento 2","Nota seguimiento 3","Definitiva general individual (50/50)"])
+    for r in data["rows"]:
+        ws.append([r["student"],r["period"],r["program"],r["semester"],r["section"],r["group"],str(r["project"] or "").upper(),r["followup2"],r["followup3"],r["definitive"]])
+    ws.freeze_panes="A2"; ws.auto_filter.ref=ws.dimensions
+    for col,width in {"A":34,"B":14,"C":18,"D":14,"E":12,"F":10,"G":58,"H":20,"I":20,"J":28}.items(): ws.column_dimensions[col].width=width
+    out=io.BytesIO(); wb.save(out); out.seek(0)
+    return Response(out.getvalue(),media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",headers={"Content-Disposition":"attachment; filename=notas_estudiantes_proyecto_aula.xlsx"})
 
 app.mount("/static",StaticFiles(directory=BASE/"static"),name="static")
 app.mount("/pdfs",StaticFiles(directory=PDF_DIR),name="pdfs")
