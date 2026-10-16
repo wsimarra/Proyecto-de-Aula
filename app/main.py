@@ -17,7 +17,7 @@ PDF_DIR.mkdir(parents=True, exist_ok=True)
 MODEL=json.loads((BASE/"data"/"model.json").read_text(encoding="utf-8"))
 DOCS_PATH=BASE/"data"/"project_documents.json"
 PROJECT_DOCUMENTS=json.loads(DOCS_PATH.read_text(encoding="utf-8")) if DOCS_PATH.exists() else {}
-app=FastAPI(title="Proyectos de Aula V9.1 – BI Institucional", version="9.1.0")
+app=FastAPI(title="Proyectos de Aula V10.0 – BI Institucional", version="10.0.0")
 
 def norm(s):
     if s is None: return ""
@@ -33,18 +33,17 @@ def _is_generic_project_title(title):
     return bool(re.fullmatch(r"(?:PROYECTO\s*\d+|GRUPO\s*#?\s*\d+)", t))
 
 def _project_exclusion_reason(project):
-    """Valida un proyecto sin descartar títulos genéricos que vienen de la fuente.
-
-    Regla V8: los títulos "PROYECTO N" se conservan porque son valores reales de
-    la fuente. Solo se excluyen grupos 0/sin título y un registro con nota 0 si
-    además no existe un título sustantivo.
-    """
+    """Valida proyectos y distingue la captura de 2026-2 aún sin nota de corte final."""
     group=norm(project.get("group"))
     if not group or group in {"0", "G0", "GRUPO 0", "GRUPO#0"}:
         return "Grupo 0 (sin proyecto)"
     title=str(project.get("title") or "").strip()
     if not title:
         return "Sin título de proyecto"
+    # En 2026-2, el cero en TER-CORTE aparece como valor inicial de la plantilla.
+    # Se cuenta el grupo como proyecto sin calificación, sin tratar el cero como nota real.
+    if str(project.get("period") or "") == "2026-2":
+        return ""
     grade=project.get("final_grade")
     try:
         grade_value=float(grade) if grade is not None else None
@@ -78,29 +77,28 @@ INVALID_PROJECTS=[p for p in MODEL["projects"] if not _is_valid_project(p)]
 COLLECTIVE_LEADERS=MODEL.get("collective_leaders",[])
 
 def load_student_cut_notes():
-    """Carga SEG-CORTE y TER-CORTE individuales desde la hoja DEFINITIVAS de cada Excel."""
+    """Carga SEG-CORTE y TER-CORTE desde DEFINITIVAS usando el vínculo explícito archivo-cohorte.
+
+    El mapa por archivo permite mantener separados 2026-1 y 2026-2 aunque compartan
+    semestre y sección, y también admite archivos de otros programas.
+    """
     try:
         from openpyxl import load_workbook
     except Exception:
         return {}
-    cohort_map={(c["semester"], str(c["section"])): c["id"] for c in MODEL["cohorts"]}
     result={}
     excel_dir=BASE/"data"/"excel"
-    for path in sorted(excel_dir.glob("*.xlsx")):
-        m=re.search(r"TGNI-(SEM-\d+)-SEC-(\d+)\.xlsx$", path.name, re.I)
-        if not m:
-            continue
-        semester, section=m.group(1).upper(), str(int(m.group(2)))
-        cohort_id=cohort_map.get((semester, section))
-        if cohort_id is None:
+    for item in MODEL.get("files", []):
+        stored=item.get("stored_filename") or item.get("filename")
+        cohort_id=item.get("cohort_id")
+        path=excel_dir/stored
+        if not path.exists() or not cohort_id:
             continue
         try:
             wb=load_workbook(path, data_only=True, read_only=True)
             if "DEFINITIVAS" not in wb.sheetnames:
-                wb.close()
-                continue
+                wb.close(); continue
             ws=wb["DEFINITIVAS"]
-            # En la hoja, B=estudiante, C=grupo, D=SEG-CORTE, E=TER-CORTE.
             for row in ws.iter_rows(min_row=5, values_only=True):
                 name=row[1] if len(row)>1 else None
                 group=row[2] if len(row)>2 else None
@@ -111,7 +109,6 @@ def load_student_cut_notes():
                 result[(cohort_id, norm(name), str(group).strip().upper())]={"followup2":seg, "followup3":ter}
             wb.close()
         except Exception:
-            # El dashboard sigue funcionando; las notas ausentes se muestran como N/D.
             continue
     return result
 
@@ -913,7 +910,7 @@ def audit():
         excluded.append(item); reason_counts[reason]+=1
     mism=[f for f in MODEL["files"] if f.get("sheet_section")!=f.get("section")]
     return {"files":MODEL["files"],"model":{
-      "version":"9.0.0","period":"2026-1 · Primer periodo","source":"Archivos Excel locales",
+      "version":"10.0.0","period":"2026-1 y 2026-2 · Datos integrados","source":"Archivos Excel locales",
       "note_rule":"Promedio de TERCER CORTE (TER-CORTE) en DEFINITIVAS para el grupo.",
       "title_rule":"Título tomado de LIDER, sección TITULOS DE LOS PROYECTOS DE AULA, según posición G01–G12.",
       "students_rule":"Estudiante = nombre normalizado; no sustituye un ID institucional cuando la fuente no lo proporciona.",
